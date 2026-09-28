@@ -316,6 +316,43 @@ java.lang.IllegalStateException: SecurityException: No screen capture permission
 `config_json` / `route_json`），**没有 `route_travelled_m` 等键**。
 所以**无法直接读文件拿到实时里程**，达标判定只能靠通知栏或时间推算。
 
+### 11. ★ 强杀微信会清掉小程序登录态
+
+`am force-stop com.tencent.mm` 之后再打开小程序，会依次弹出：
+
+```
+「苍霞乐跑」启动页 → [立即登录] → 登录页(勾选协议) → [授权登录] → 首页
+```
+
+**必须全部点完才能进首页** —— 脚本原来的固定流程会全部点空，卡在登录页。
+
+**修法两条（都已实现）**：
+
+1. **清场不杀微信** —— `ui.closeMiniProgram()` 改用「···」→「重新进入小程序」
+   温和退出，登录态保留
+2. **脚本开头加登录兜底** —— `ui.handleLoginIfNeeded()` 检测到登录页就自动走
+   「立即登录 → 勾选协议 → 授权登录」
+
+> 页面识别靠 **root 截屏 + 像素采样**（`captureScreen()` 无 MediaProjection
+> 授权，但 root 的 `screencap` 命令可以）。
+
+### 12. ★ 桌面可能停在非第一页
+
+脚本按固定坐标点桌面图标，但**用户手动翻页后图标就不在预期位置了**，点击点空。
+
+**修法**：用 root 截屏采样图标位置的颜色，判断图标是否可见；不可见就尝试翻页，
+最多 4 轮。日志里会打印 `第 N 轮：图标可见/不可见（root 截屏判定）`。
+
+> **最省事的做法：把「苍霞乐跑」快捷方式固定在桌面第一页。**
+
+### 13. `shell(cmd, true)` 的第二参数才是 root 标志
+
+AutoX.js 的 `shell(cmd, root)` 里，**第二个参数**才表示用 root 执行。
+拼 `su -c '...'` 会因引号被 AutoX 的 shell 吃掉而失败（实测读不到文件）。
+
+另外返回值是 `ShellResult` 对象，要用 `.result` 取 stdout
+（直接 `toString()` 得到的是 `ShellResult{code=0, error='', result='...'}` 这种格式）。
+
 ---
 
 ## 八、常见问题
@@ -381,18 +418,56 @@ svc power stayon true;
 
 ---
 
-## 十、目录结构
+## 十、目录结构与模块划分
+
+**代码按职责拆分，改一处不影响其他部分：**
 
 ```
 .
-├── README.md                 # 本文档
+├── README.md                     # 本文档
 ├── scripts/
-│   ├── caoxia-run.js         # AutoX.js 主脚本
-│   ├── locate-color.py       # 按颜色定位元素（WebView/小程序场景）
-│   └── recon-ui.py           # 控件树侦察（原生界面场景）
+│   ├── caoxia-run.js             # ★ 入口：只做流程编排（定时任务指向它）
+│   ├── caoxia-lib/               # ★ 实现模块
+│   │   ├── config.js             #   全部坐标与参数 ← 换设备/调参只改这个
+│   │   ├── util.js               #   日志 / root / 单实例锁 / 环境保障
+│   │   ├── fakeloc.js            #   FakeLoc 控制（启停/坐标/达标通知）
+│   │   └── ui.js                 #   小程序 UI 操作（含登录页兜底）
+│   ├── locate-color.py           # 按颜色定位元素（WebView/小程序场景）
+│   └── recon-ui.py               # 控件树侦察（原生界面场景）
 └── docs/
-    └── 技术方案.md            # 完整技术方案与源码分析
+    └── 技术方案.md                # 完整技术方案与源码分析
 ```
+
+**设备上的部署结构**（两个都要推）：
+
+```
+/sdcard/脚本/
+├── caoxia-run.js                 ← 定时任务指向它
+└── caoxia-lib/
+    ├── config.js
+    ├── util.js
+    ├── fakeloc.js
+    └── ui.js
+```
+
+```bash
+# 一键部署
+adb push scripts/caoxia-run.js  /sdcard/脚本/
+adb push scripts/caoxia-lib     /sdcard/脚本/
+```
+
+### 改动时的影响范围
+
+| 你要改什么 | 只动哪个文件 |
+| --- | --- |
+| 跑多少公里 / 配速 / 坐标 | `caoxia-lib/config.js` |
+| FakeLoc 启停逻辑 | `caoxia-lib/fakeloc.js` |
+| 小程序点击流程 | `caoxia-lib/ui.js` |
+| 日志 / 权限 / 锁 | `caoxia-lib/util.js` |
+| 整体流程顺序 | `caoxia-run.js` |
+
+> `config.js` 与逻辑完全解耦 —— 升级脚本时**直接覆盖 lib 里的其他文件即可，
+> 你的坐标和参数不会丢**。
 
 ---
 
