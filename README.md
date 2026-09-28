@@ -160,6 +160,9 @@ duration  = fakeLocKm × 1000 / speedMs × margin
 | ⑨ | 二次确认弹窗「结束跑步」 | `(376, 1337)` |
 | ⑩ | 小程序菜单「···」 | `(877, 182)` |
 | ⑪ | 「重新进入小程序」 | `(716, 1900)` |
+| ⑫ | **登录页**「立即登录」<br>（仅登录态丢失时出现，脚本会自动处理） | `(540, 1175)` |
+| ⑬ | **登录页**协议勾选框 | `(108, 680)` |
+| ⑭ | **登录页**「授权登录」 | `(540, 880)` |
 
 ---
 
@@ -214,14 +217,31 @@ dumpsys notification --noredact | grep -c 'NotificationRecord.*fakeloc_target'
 
 ### 6.4 清场
 
-流程结束后（root）：
-
 ```js
-am force-stop com.tencent.mm   // 关微信（连带小程序）
-am force-stop com.mo.fakeloc   // 关 FakeLoc
+broadcast(STOP_ROUTE)          // 停路线模拟
+am force-stop com.mo.fakeloc   // 关 FakeLoc 进程
+// 微信：用「···」→「重新进入小程序」温和退出，**不杀进程**
 ```
 
+> ⚠️ **不要 `am force-stop com.tencent.mm`** —— 那会清掉小程序登录态，
+> 下次打开要依次弹「立即登录 → 勾选协议 → 授权登录」。详见踩坑 §11。
+
 不杀 AutoX 自身 —— 那会连带关掉无障碍，且脚本还没退出。
+
+### 6.5 屏幕唤醒与解锁
+
+定时任务常在息屏时触发，所以流程第一步是「唤醒 + 解锁 + 保常亮」：
+
+```js
+input keyevent KEYCODE_WAKEUP    // 只亮屏，不解锁！
+wm dismiss-keyguard              // ★ 必须：解除锁屏
+svc power stayon true            // 插电时常亮
+```
+
+解锁失败（手机真设了密码）会**直接中止流程**，绝不在锁屏上瞎点。
+
+> 详见踩坑 §14（WAKEUP 不解锁）和 §15（解锁后无障碍会重新绑定，
+> 所以点击全部改走 root 的 `input` 命令）。
 
 ---
 
@@ -352,6 +372,64 @@ AutoX.js 的 `shell(cmd, root)` 里，**第二个参数**才表示用 root 执�
 
 另外返回值是 `ShellResult` 对象，要用 `.result` 取 stdout
 （直接 `toString()` 得到的是 `ShellResult{code=0, error='', result='...'}` 这种格式）。
+
+### 14. ★★ `KEYCODE_WAKEUP` 只亮屏，不解锁
+
+定时任务在息屏时触发，脚本发了 `KEYCODE_WAKEUP`，屏幕亮了 —— **但仍停在锁屏**。
+
+实测：
+
+| 步骤 | `mDreamingLockscreen` |
+| --- | --- |
+| 息屏 | true |
+| `KEYCODE_WAKEUP` | **true（仍在锁屏！）** |
+| `wm dismiss-keyguard` | **false** ✅ |
+
+**ColorOS 即使没设密码也有锁屏界面（需上滑）。** 不解锁的后果：
+
+- 后续所有点击落在锁屏上 → 全部无效
+- `wakeFakeLoc()` 启动的 FakeLoc 被压在锁屏下面
+  → 用户手动解锁后看到它，以为"脚本在乱序操作"
+
+**修法**：唤醒后加 `wm dismiss-keyguard`（adb shell 权限即可，不需要 root）。
+解锁失败（真设了密码）则**中止流程**，绝不在锁屏上瞎点。
+
+### 15. ★★ 解锁后无障碍会重新绑定
+
+`wm dismiss-keyguard` 之后，无障碍服务需要重新绑定，这期间
+`click()` / `press()` 直接抛：
+
+```
+ScriptException: 无障碍服务已启用但并未运行，这可能是安卓的BUG，
+您可能需要重启手机或重启无障碍服务
+```
+
+**修法**：**点击 / 长按 / 回桌面全改用 root 的 `input` 命令** —— 完全不依赖无障碍：
+
+```js
+sh("input tap " + x + " " + y);                                   // 点击
+sh("input swipe " + x + " " + y + " " + x + " " + y + " " + ms);  // 长按（起止同点）
+sh("input keyevent KEYCODE_HOME");                                // 回桌面
+```
+
+无 root 时退回无障碍 API（带 3 次重试）。
+
+### 16. ★★ 判断界面状态：别只看包名
+
+这是本次踩得最深的坑 —— **日志会骗人**：
+
+| 想判断 | ❌ 错误做法 | ✅ 正确做法 |
+| --- | --- | --- |
+| 小程序是否打开 | `currentPackage() == com.tencent.mm`<br>（微信在后台时**立即返回 true**，脚本"假成功"） | Activity 名含 **`AppBrandUI00`** |
+| 是否在桌面 | Activity 含 `"Launcher"`<br>（微信主界面是 **`LauncherUI`**，会被误判成桌面） | **包名**含 launcher 且排除微信 |
+| 是否锁屏 | — | `dumpsys window \| grep mDreamingLockscreen` |
+| 点击是否被吞 | — | `home()` 后等 3s（桌面切换动画未结束） |
+
+**另外**：`home()` 后立刻点快捷方式会被吞掉（动画没结束），所以脚本加了
+「等桌面就绪 + 再稳 1 秒」，并在点击后**轮询 Activity 名**确认真的打开了。
+
+**卡住时的排查手段**：脚本每秒打印一次「当前停在哪个界面」
+（桌面 / 微信主界面 / 小程序 / FakeLoc / 无前台 Activity），一眼就能看出卡在哪。
 
 ---
 
