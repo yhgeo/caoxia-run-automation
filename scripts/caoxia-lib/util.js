@@ -91,10 +91,48 @@ function releaseLock() {
 
 // ============================== 环境保障 ==============================
 
+/** 是否处于锁屏状态 */
+function isKeyguardShowing() {
+    var out = sh("dumpsys window 2>/dev/null | grep -o 'mDreamingLockscreen=[a-z]*' | head -1");
+    return String(out).indexOf("true") >= 0;
+}
+
 /**
- * 唤醒屏幕并保持常亮。
+ * 解除锁屏。
+ *
+ * ⚠️ 关键：`KEYCODE_WAKEUP` **只亮屏，不解锁**。
+ *    ColorOS 即使没设密码也有锁屏界面（需上滑），所以唤醒后必须再
+ *    `wm dismiss-keyguard`，否则后续所有点击都落在锁屏上，
+ *    表现为「屏幕亮了但没进桌面 / 解锁后看到别的 App / 之后操作全乱」。
+ *
+ * @return true = 已解锁（或本来就没锁）；false = 无法解锁（设了密码）
+ */
+function dismissKeyguard() {
+    if (!isKeyguardShowing()) {
+        log("  锁屏: 未锁");
+        return true;
+    }
+    log("  ⚠️ 检测到锁屏 → dismiss-keyguard");
+    sh("wm dismiss-keyguard");
+    sleep(2000);
+
+    if (isKeyguardShowing()) {
+        log("  ❌ 仍未解锁（手机设了密码？脚本无法自动解锁）");
+        return false;
+    }
+    log("  ✅ 已解锁，等无障碍重新绑定");
+    // 解锁会让无障碍服务重新绑定，这期间 click()/press() 会抛异常，
+    // 所以留出缓冲（ui.js 里另有重试兜底）
+    sleep(2500);
+    return true;
+}
+
+/**
+ * 唤醒屏幕 → 解锁 → 保持常亮。
  *
  * 定时任务常在息屏时触发，而 input 类操作与 UI 渲染在休眠态下不可靠。
+ *
+ * @return true = 屏幕可用；false = 无法解锁，调用方应中止流程
  */
 function ensureScreenOn() {
     var w = sh("dumpsys power | grep -E 'mWakefulness=' | head -1");
@@ -105,8 +143,13 @@ function ensureScreenOn() {
         sh("input keyevent KEYCODE_WAKEUP");
         sleep(1500);
     }
+
+    var unlocked = dismissKeyguard();
+
     sh("svc power stayon true");   // 插电时常亮
     sleep(500);
+
+    return unlocked;
 }
 
 /** 确保 AutoX 的无障碍服务开着（root 可直接改 secure settings） */
@@ -150,11 +193,18 @@ function ensureNotificationAccess() {
     return ok;
 }
 
-/** 一键完成全部前置保障 */
+/**
+ * 一键完成全部前置保障。
+ * @return true = 环境就绪；false = 屏幕无法解锁，调用方应中止
+ */
 function prepareEnvironment() {
-    ensureScreenOn();
+    if (!ensureScreenOn()) {
+        log("❌ 屏幕无法解锁，中止流程（避免在锁屏上乱点）");
+        return false;
+    }
     ensureAccessibility();
     ensureNotificationAccess();
+    return true;
 }
 
 // ============================== 当前前台 App ==============================
@@ -186,6 +236,8 @@ module.exports = {
     acquireLock: acquireLock,
     releaseLock: releaseLock,
     ensureScreenOn: ensureScreenOn,
+    dismissKeyguard: dismissKeyguard,
+    isKeyguardShowing: isKeyguardShowing,
     ensureAccessibility: ensureAccessibility,
     ensureNotificationAccess: ensureNotificationAccess,
     prepareEnvironment: prepareEnvironment,

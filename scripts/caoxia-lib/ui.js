@@ -16,30 +16,95 @@ var U = require("./util.js");
 
 // ============================== 基础操作 ==============================
 
+/**
+ * 无障碍操作带重试。
+ *
+ * ⚠️ 解锁屏幕后无障碍服务会重新绑定，这期间 click()/press() 可能抛
+ *    ScriptInterruptedException（表现为「脚本莫名中断」）。
+ *    所以包一层重试，最多 3 次。
+ */
+function a11yCall(fn, desc) {
+    for (var i = 1; i <= 3; i++) {
+        try {
+            fn();
+            return true;
+        } catch (e) {
+            U.log("  ⚠️ " + desc + " 第 " + i + " 次失败: " + e);
+            sleep(1200);      // 等无障碍重新绑定
+        }
+    }
+    U.log("  ❌ " + desc + " 连续 3 次失败");
+    return false;
+}
+
+/**
+ * 点击。**优先用 root 的 `input tap`** —— 它不依赖无障碍服务。
+ *
+ * ⚠️ 为什么要这样：解锁屏幕（dismiss-keyguard）会让无障碍服务重新绑定，
+ *    期间 click() 会抛
+ *      ScriptException: 无障碍服务已启用但并未运行，这可能是安卓的BUG
+ *    而 root 的 input 命令完全不受影响，更稳。
+ *    无 root 时退回无障碍 click（带重试）。
+ */
 function tapXY(xy, label) {
     U.log("点击" + (label ? "「" + label + "」" : "") + " [" + xy[0] + ", " + xy[1] + "]");
-    if (!C.CFG.dryRun) click(xy[0], xy[1]);
+    if (!C.CFG.dryRun) {
+        if (U.isRoot()) {
+            U.sh("input tap " + xy[0] + " " + xy[1]);
+        } else {
+            a11yCall(function () { click(xy[0], xy[1]); }, "click");
+        }
+    }
     sleep(C.CFG.timeout.cooldown);
 }
 
+/** 长按。同样优先走 root 的 `input swipe`（起止同点 = 长按） */
 function pressXY(xy, label, ms) {
     ms = ms || 300;
     U.log("长按" + (label ? "「" + label + "」" : "") + " [" + xy[0] + ", " + xy[1] + "] " + ms + "ms");
-    if (!C.CFG.dryRun) press(xy[0], xy[1], ms);
+    if (!C.CFG.dryRun) {
+        if (U.isRoot()) {
+            U.sh("input swipe " + xy[0] + " " + xy[1] + " " + xy[0] + " " + xy[1] + " " + ms);
+        } else {
+            a11yCall(function () { press(xy[0], xy[1], ms); }, "press");
+        }
+    }
     sleep(C.CFG.timeout.cooldown);
 }
 
-/** 按文字点击（原生控件有效；小程序自绘读不到 → 返回 false 由调用方回退坐标） */
+/** 回桌面。优先 root 的 input keyevent（不依赖无障碍） */
+function goHome() {
+    if (C.CFG.dryRun) return;
+    if (U.isRoot()) U.sh("input keyevent KEYCODE_HOME");
+    else home();
+}
+
+/**
+ * 按文字点击（原生控件有效；小程序自绘读不到 → 返回 false 由调用方回退坐标）。
+ *
+ * ⚠️ `text().findOnce()` 依赖无障碍；无障碍未就绪时会抛异常，
+ *    所以整段包 try/catch，失败就当作"没找到"由调用方回退坐标。
+ */
 function tapText(texts, timeoutMs) {
     var deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         for (var i = 0; i < texts.length; i++) {
-            var n = text(texts[i]).findOnce();
+            var n = null;
+            try {
+                n = text(texts[i]).findOnce();
+            } catch (e) {
+                // 无障碍未就绪，直接放弃文字查找
+                return false;
+            }
             if (n) {
                 U.log("按文字命中「" + texts[i] + "」");
                 if (!C.CFG.dryRun) {
                     var b = n.bounds();
-                    click(b.centerX(), b.centerY());
+                    if (U.isRoot()) {
+                        U.sh("input tap " + b.centerX() + " " + b.centerY());
+                    } else {
+                        a11yCall(function () { click(b.centerX(), b.centerY()); }, "click");
+                    }
                 }
                 sleep(C.CFG.timeout.cooldown);
                 return true;
@@ -167,33 +232,164 @@ function backOneHomePage() {
  *     检测图标是否可见 → 不可见就尝试翻页 → 最多 4 轮
  *    （建议把「苍霞乐跑」快捷方式固定在桌面第一页，最省事）
  */
+/**
+ * 当前前台是不是**小程序**。
+ *
+ * ⚠️ 不能用 `currentPackage() == com.tencent.mm` 判断 —— 微信进程本来
+ *    就在后台，`home()` 后可能仍被判为前台，导致「假成功」。
+ *    必须看 Activity 名：小程序是 `AppBrandUI00`，微信主界面是 `LauncherUI`。
+ */
+function currentActivity() {
+    return U.sh("dumpsys activity activities | grep topResumedActivity | head -1");
+}
+
+function isMiniProgramOpen() {
+    return currentActivity().indexOf("AppBrandUI") >= 0;
+}
+
+/** 把当前前台 Activity 翻译成人话，便于排查卡在哪一步 */
+function describeScreen(act) {
+    act = String(act || "");
+    if (act.indexOf("AppBrandUI") >= 0) return "小程序";
+    if (act.indexOf("LauncherUI") >= 0) return "微信主界面";
+    if (act.indexOf("Splash") >= 0) return "微信启动页";
+    if (act.indexOf("com.mo.fakeloc") >= 0) return "FakeLoc";
+    if (act.indexOf("autojs") >= 0) return "AutoX";
+    if (act.indexOf("com.android.launcher") >= 0) return "桌面";
+    if (trim(act) === "") return "（无前台 Activity / 息屏）";
+    var m = /topResumedActivity=ActivityRecord\{\S+ \S+ ([\w.\/]+)/.exec(act);
+    return m ? m[1] : "未知";
+}
+
+function trim(s) { return String(s == null ? "" : s).replace(/^\s+|\s+$/g, ""); }
+
+/**
+ * 等小程序真正打开。
+ *
+ * ⚠️ 点击快捷方式后，微信要冷启动 + 加载小程序，实测**可能十几秒**，
+ *    所以这里超时给得比较宽，并且每秒把「当前停在哪个界面」记进日志，
+ *    卡住时能直接看出是「微信主界面」还是「启动页」还是别的。
+ */
+function waitMiniProgram(timeoutMs) {
+    var w = 0;
+    var lastState = "";
+    while (w < timeoutMs) {
+        var act = currentActivity();
+        if (act.indexOf("AppBrandUI") >= 0) {
+            U.log("  ✅ 小程序已打开（等待 " + w + "ms）");
+            return true;
+        }
+        var state = describeScreen(act);
+        if (state !== lastState) {
+            U.log("  …等待中 " + w + "ms，当前界面: " + state);
+            lastState = state;
+        }
+        sleep(1000);
+        w += 1000;
+    }
+    U.log("  ⚠️ 等待小程序超时（" + timeoutMs + "ms），最后停在: " + describeScreen(currentActivity()));
+    return false;
+}
+
+/**
+ * 是否已经在桌面。
+ *
+ * ⚠️ 不能用 `indexOf("Launcher")` 判断 —— 微信主界面的 Activity 是
+ *    `com.tencent.mm/.ui.LauncherUI`，也含 "Launcher"，会被误判成桌面。
+ *    所以按**包名**判断，并显式排除微信/AutoX/FakeLoc。
+ */
+function isHomeReady() {
+    var pkg = U.currentApp();
+    if (pkg === C.PKG.wechat) return false;
+    if (pkg.indexOf("autojs") >= 0 || pkg.indexOf("fakeloc") >= 0) return false;
+    return pkg.indexOf("launcher") >= 0;
+}
+
+/** 等桌面真正到前台（home() 后立刻点击会点空） */
+function waitHomeReady(timeoutMs) {
+    var w = 0;
+    while (w < timeoutMs) {
+        if (isHomeReady()) return true;
+        sleep(400);
+        w += 400;
+    }
+    U.log("  ⚠️ 等待桌面超时（当前: " + describeScreen(currentActivity()) + "）");
+    return false;
+}
+
 function openMiniProgram() {
     U.log("回桌面 → 打开乐跑小程序");
-    if (!C.CFG.dryRun) home();
-    sleep(2000);
+    goHome();
+    // ⚠️ 桌面切换有动画，太早点快捷方式会被吞掉（实测 1.5s 不够，点了没反应）
+    sleep(3000);
+    waitHomeReady(C.CFG.timeout.homeReady);
+    sleep(1000);   // 再稳一下
 
-    var opened = false;
+    // ---- 快路径：直接点一次（桌面通常就在第一页）----
+    tapXY(C.XY.shortcutRun, "苍霞乐跑快捷方式");
+    if (waitMiniProgram(C.CFG.timeout.miniProgram)) {
+        afterMiniProgramOpened();
+        return;
+    }
+
+    // ---- 兜底 1：只唤起了微信、没进小程序 ----
+    if (describeScreen(currentActivity()) === "微信主界面") {
+        U.log("  兜底：停在微信主界面 → 退回桌面重试");
+        goHome();
+        sleep(3000);
+        waitHomeReady(C.CFG.timeout.homeReady);
+        sleep(1000);
+        tapXY(C.XY.shortcutRun, "苍霞乐跑快捷方式");
+        if (waitMiniProgram(C.CFG.timeout.miniProgram)) {
+            afterMiniProgramOpened();
+            return;
+        }
+    }
+
+    // ---- 兜底 2：图标可能不在当前页，逐页找 ----
+    U.log("  兜底：逐页查找快捷方式");
     for (var attempt = 1; attempt <= 4; attempt++) {
         var visible = shortcutVisible();
         U.log("  第 " + attempt + " 轮：图标" + (visible ? "可见" : "不可见") + "（root 截屏判定）");
-
         tapXY(C.XY.shortcutRun, "苍霞乐跑快捷方式");
-        sleep(4000);
-        if (U.currentApp() === C.PKG.wechat) {
-            opened = true;
+        if (waitMiniProgram(C.CFG.timeout.miniProgram)) {
+            afterMiniProgramOpened();
+            return;
+        }
+        backOneHomePage();
+    }
+    U.log("  ❌ 未打开小程序 —— 请确认快捷方式在桌面第一页");
+}
+
+/** 小程序首页「校园乐跑」图标是否可见（绿色圆底，采样图标边缘避开白色图案） */
+function isHomeIconVisible() {
+    var cx = C.XY.entryRun[0], cy = C.XY.entryRun[1];
+    var pts = [[cx - 38, cy], [cx + 38, cy], [cx, cy - 38], [cx, cy + 38]];
+    for (var i = 0; i < pts.length; i++) {
+        if (isGreen(pixel(pts[i][0], pts[i][1]))) return true;
+    }
+    return false;
+}
+
+/**
+ * 小程序已打开后的收尾：等**首页真正渲染出来** + 登录兜底。
+ *
+ * ⚠️ AppBrandUI 出现 ≠ 页面画好。小程序还要拉数据、渲染，实测又要几秒。
+ *    所以这里用 root 截屏轮询「校园乐跑」图标是否出现，出现才继续。
+ */
+function afterMiniProgramOpened() {
+    var ok = false;
+    for (var i = 1; i <= 12; i++) {
+        sleep(1000);
+        if (isHomeIconVisible()) {
+            U.log("  ✅ 首页已渲染（等了 " + i + "s）");
+            ok = true;
             break;
         }
-        if (attempt < 4) backOneHomePage();
     }
+    if (!ok) U.log("  ⚠️ 12s 内未识别到首页图标，继续尝试（可能是登录页）");
 
-    if (!opened) {
-        U.log("  ⚠️ 4 轮均未打开小程序 —— 桌面可能不在第一页，请把快捷方式固定在首页");
-    } else {
-        var waited = U.waitForApp(C.PKG.wechat, 25000);
-        U.log("微信已前台（等待 " + waited + "ms），再等页面渲染");
-        sleep(4000);
-        handleLoginIfNeeded();
-    }
+    handleLoginIfNeeded();
 }
 
 /** 首页 → 跑步页 */
@@ -258,7 +454,7 @@ function closeMiniProgram() {
     tapXY(C.XY.wxReenter, "重新进入小程序");
     sleep(4500);
 
-    if (!C.CFG.dryRun) home();
+    goHome();
     sleep(1200);
 }
 
