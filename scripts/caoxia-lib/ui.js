@@ -13,6 +13,7 @@
 
 var C = require("./config.js");
 var U = require("./util.js");
+var R = require("./recorder.js");   // 调试截图（CFG.debug=false 时全是空操作）
 
 // ============================== 基础操作 ==============================
 
@@ -149,6 +150,148 @@ function isGreen(p) {
 /** 深色（用于识别首页顶部的用户信息卡片） */
 function isDark(p) {
     return p && (p.r + p.g + p.b) < 400;
+}
+
+/** 深色药丸（按钮底色）。比 isDark 更严，避免把地图上的深色元素误算进来 */
+function isPillDark(p) {
+    return p && (p.r + p.g + p.b) < 300;
+}
+
+/** 灰色蒙层。弹窗出现时整屏被压暗，白底页会变成 ~(102,102,102) */
+function isGrayish(p) {
+    return p && Math.abs(p.r - p.g) < 20 && Math.abs(p.g - p.b) < 20 &&
+           p.r >= 60 && p.r <= 190;
+}
+
+// ---- 跑步状态判定（坐标实测自 2026-09-29 的截图，见 config.js PROBE）----
+
+/** 跑步中：底部中央被「长按暂停」深色药丸覆盖 */
+function isRunning() {
+    return isPillDark(pixel(C.PROBE.pausePill[0], C.PROBE.pausePill[1]));
+}
+
+/** 暂停后：左下「结束跑步」深色 + 右下「继续跑步」绿色 */
+function isPaused() {
+    return isPillDark(pixel(C.PROBE.endBtn[0], C.PROBE.endBtn[1])) &&
+           isGreen(pixel(C.PROBE.resumeBtn[0], C.PROBE.resumeBtn[1]));
+}
+
+/** 停在「校园乐跑」跑步页：中部是绿色「开始乐跑」大按钮 */
+function isRunPage() {
+    return isGreen(pixel(C.XY.btnStart[0], C.XY.btnStart[1]));
+}
+
+/** 有弹窗（整屏被蒙层压暗） */
+function hasDialog() {
+    return isGrayish(pixel(C.PROBE.dialogScrim[0], C.PROBE.dialogScrim[1]));
+}
+
+// ============== 按钮定位（按颜色扫描，不依赖写死的坐标）==============
+//
+// ⚠️ 为什么不能写死坐标：**时间窗内外界面不一样**
+//    （窗内弹「成绩合格标准」，窗外弹「跑步提示·自由跑」），
+//    不同 ROM/分辨率/字号也会让按钮上下浮动几十像素。
+//    所以底部按钮一律**先按颜色找**，找到就点它的真实中心，
+//    找不到才回退到 config.js 里的实测坐标。
+
+/** 用 root 截屏并读成位图 */
+function shotImage() {
+    if (!U.isRoot()) return null;
+    try {
+        U.sh("screencap -p " + SHOT);
+        return images.read(SHOT);
+    } catch (e) {
+        return null;
+    }
+}
+
+function rgbAt(img, x, y) {
+    var c = images.pixel(img, x, y);
+    return { r: (c >> 16) & 255, g: (c >> 8) & 255, b: c & 255 };
+}
+
+/**
+ * 在 [y0,y1] 条带里按颜色找按钮色块。
+ *
+ * 做法：每隔几行/几列采样，统计每个 x 列「命中该颜色」的比例，
+ *       取连续且足够宽的一段作为候选，再**挑离 hintX 最近的那个**。
+ *
+ * ⚠️ 为什么要 hintX：地图上本身就有大片绿色（公园/绿地），
+ *    光按颜色找会认错。用 config 里的实测坐标当先验，只做小幅修正。
+ *
+ * @param kind      "dark"（深色药丸）| "green"（绿色药丸）
+ * @param xMin,xMax 限定横向范围（用于区分并排的两个按钮）
+ * @param minWidth  最小宽度（采样列数），过滤掉零碎同色块
+ * @param hintX     期望的中心 x（config 实测值）
+ * @return {x,y} 或 null
+ */
+function locateButton(kind, y0, y1, xMin, xMax, minWidth, hintX) {
+    var img = shotImage();
+    if (!img) return null;
+    var W = img.getWidth();
+    if (xMax > W) xMax = W;
+
+    var cnt = {}, rows = 0, x, y;
+    for (y = y0; y <= y1; y += 8) {
+        rows++;
+        for (x = xMin; x < xMax; x += 4) {
+            var p = rgbAt(img, x, y);
+            if (kind === "dark" ? isPillDark(p) : isGreen(p)) {
+                cnt[x] = (cnt[x] || 0) + 1;
+            }
+        }
+    }
+    img.recycle();
+    if (rows === 0) return null;
+
+    // 命中率过半的列才算按钮内部
+    //（药丸中间有白色文字，会把那几行「打断」，所以阈值取 0.5 而不是 0.6）
+    var need = Math.ceil(rows * 0.5);
+    var keys = [];
+    for (var k in cnt) {
+        if (cnt[k] >= need) keys.push(parseInt(k, 10));
+    }
+    if (keys.length === 0) return null;
+    keys.sort(function (a, b) { return a - b; });
+
+    // 切成长度 >= minWidth 的连续段（允许 24px 以内的采样空隙）
+    var spans = [], s = keys[0];
+    for (var i = 1; i < keys.length; i++) {
+        if (keys[i] - keys[i - 1] > 24) {
+            if (keys[i - 1] - s >= minWidth) spans.push([s, keys[i - 1]]);
+            s = keys[i];
+        }
+    }
+    if (keys[keys.length - 1] - s >= minWidth) spans.push([s, keys[keys.length - 1]]);
+    if (spans.length === 0) return null;
+
+    // 就近选：挑中心离 hintX 最近的那段，且偏移不能太离谱
+    var best = null, bestD = 1e9;
+    for (var j = 0; j < spans.length; j++) {
+        var cx = (spans[j][0] + spans[j][1]) / 2;
+        var d = Math.abs(cx - hintX);
+        if (d < bestD) { bestD = d; best = cx; }
+    }
+    if (bestD > 250) return null;      // 偏太远，宁可回退配置坐标
+
+    return { x: Math.round(best), y: Math.round((y0 + y1) / 2), off: Math.round(best - hintX) };
+}
+
+/** 底部按钮条带的纵向范围（实测药丸在 2136~2260） */
+var BTN_Y0 = 2110, BTN_Y1 = 2290;
+
+/**
+ * 点底部按钮：优先按颜色定位（以配置坐标为先验做小幅修正），失败回退配置坐标。
+ * @return 实际使用的坐标
+ */
+function tapBottomButton(fallbackXY, kind, xMin, xMax, minWidth, label, pressMs) {
+    var loc = locateButton(kind, BTN_Y0, BTN_Y1, xMin, xMax, minWidth, fallbackXY[0]);
+    var xy = loc ? [loc.x, loc.y] : fallbackXY;
+    U.log("  定位「" + label + "」→ [" + xy[0] + ", " + xy[1] + "]" +
+          (loc ? "（按颜色修正 " + (loc.off >= 0 ? "+" : "") + loc.off + "px）" : "（用配置坐标）"));
+    if (pressMs) pressXY(xy, label, pressMs);
+    else tapXY(xy, label);
+    return xy;
 }
 
 /** 是否停在「立即登录」页（该位置有绿色按钮） */
@@ -379,62 +522,132 @@ function isHomeIconVisible() {
  */
 function afterMiniProgramOpened() {
     var ok = false;
+    var where = "";
     for (var i = 1; i <= 12; i++) {
         sleep(1000);
-        if (isHomeIconVisible()) {
-            U.log("  ✅ 首页已渲染（等了 " + i + "s）");
-            ok = true;
-            break;
-        }
+        if (isHomeIconVisible()) { ok = true; where = "首页"; break; }
+        // ⚠️ 小程序会**记住上次停留的页面** —— 上次若停在跑步页，
+        //    重开就直接是跑步页（实测 2026-09-29）。这里必须一并认出来，
+        //    否则会白等 12s，后面 enterRunPage 还会多点一次「校园乐跑」。
+        if (isRunPage()) { ok = true; where = "跑步页（小程序记住了上次页面）"; break; }
     }
-    if (!ok) U.log("  ⚠️ 12s 内未识别到首页图标，继续尝试（可能是登录页）");
+    if (ok) U.log("  ✅ 页面已渲染：" + where + "（等了 " + i + "s）");
+    else U.log("  ⚠️ 12s 内既不是首页也不是跑步页（可能是登录页）");
 
     handleLoginIfNeeded();
+    R.snap("01b-小程序首页");
 }
 
-/** 首页 → 跑步页 */
+/** 首页 → 跑步页（若小程序记住了上次页面、已停在跑步页，则跳过点击） */
 function enterRunPage() {
-    tapXY(C.XY.entryRun, "校园乐跑");
-    sleep(4500);
+    if (isRunPage()) {
+        U.log("  已直接停在跑步页，跳过「校园乐跑」点击");
+    } else {
+        tapXY(C.XY.entryRun, "校园乐跑");
+        sleep(4500);
+    }
+    R.snap("02-跑步页");
 }
 
-/** 跑步页 → 点开始乐跑 */
+/** 跑步页 → 点开始乐跑（点完会弹「成绩合格标准」或「跑步提示」） */
 function tapStart() {
-    if (!tapText(C.CFG.startTexts, 6000)) {
-        tapXY(C.XY.btnStart, "开始乐跑");
+    for (var i = 1; i <= 3; i++) {
+        if (!tapText(C.CFG.startTexts, 6000)) {
+            tapXY(C.XY.btnStart, "开始乐跑");
+        }
+        sleep(2500);
+        if (hasDialog() || !isRunPage()) {
+            U.log("  ✅ 已离开跑步页（第 " + i + " 次点击生效）");
+            break;
+        }
+        U.log("  ⚠️ 第 " + i + " 次点「开始乐跑」没反应，重试");
     }
-    sleep(3000);
+    R.snap("03-点开始乐跑后");
 }
 
 /**
- * 关闭地图页弹窗（自绘，只能盲点）。
- *   a) 「成绩合格标准」→「我知道了」：时间窗内必现，不点掉后面会被吞
+ * 关掉提示弹窗（自绘，只能盲点）。
+ *   a) 「成绩合格标准」→「我知道了」：时间窗内必现
  *   b) 「跑步提示」→「自由跑」：仅时间窗外
+ *
+ * ⚠️ 到底弹哪个由**时间窗**决定，脚本无法预知，所以两个位置都点一遍；
+ *    再用 hasDialog() 校验是否真的关掉，没关掉就补点。
  */
 function closeMapDialogs() {
-    U.log("关闭地图页弹窗（盲点）");
+    U.log("关闭提示弹窗（盲点）");
     pressXY(C.XY.dlgAck, "我知道了(成绩合格标准)", 200);
     sleep(1500);
-    pressXY(C.XY.dlgFreeRun, "自由跑(仅时间窗外)", 200);
-    sleep(1500);
-}
-
-/** 地图页 → 正式开始跑步 */
-function startRunning() {
-    if (!tapText(C.CFG.startTexts, 5000)) {
-        tapXY(C.XY.btnStartMap, "开始乐跑(地图页)");
+    if (hasDialog()) {
+        pressXY(C.XY.dlgFreeRun, "自由跑(仅时间窗外)", 200);
+        sleep(1500);
     }
-    sleep(3000);
+    if (hasDialog()) {
+        U.log("  ⚠️ 弹窗仍在，再补点一次「我知道了」");
+        pressXY(C.XY.dlgAck, "我知道了(成绩合格标准)", 200);
+        sleep(1500);
+    }
+    U.log(hasDialog() ? "  ❌ 弹窗没关掉（后面很可能点空，见 step_04 截图）"
+                      : "  ✅ 弹窗已关闭");
+    R.snap("04-关弹窗后");
 }
 
-/** 长按暂停 → 结束跑步 → 二次确认 */
+/**
+ * 地图页 → 正式开始跑步。
+ *
+ * ★ 必须校验：这一步点空的话后面整段都是白跑 ——
+ *   2026-09-29 早 7:30 的事故就出在「点没点中没人知道」。
+ */
+function startRunning() {
+    for (var i = 1; i <= 3; i++) {
+        if (!tapText(C.CFG.startTexts, 5000)) {
+            tapBottomButton(C.XY.btnStartMap, "green", 0, 1080, 70, "开始乐跑(地图页)", 0);
+        }
+        sleep(3500);
+        if (isRunning()) {
+            U.log("  ✅ 已确认进入跑步状态（第 " + i + " 次点击生效）");
+            R.snap("05-开跑后");
+            return true;
+        }
+        U.log("  ⚠️ 第 " + i + " 次点「开始乐跑(地图页)」没进入跑步状态，重试");
+    }
+    U.log("  ❌ 连续 3 次都没进入跑步状态！本次不可能产生成绩");
+    R.snap("05-开跑失败");
+    return false;
+}
+
+/**
+ * 长按暂停 → 结束跑步 → 二次确认。
+ *
+ * ★ 必须校验：暂停没生效的话，「结束跑步」「确认结束」全部落空，
+ *   跑步一直没结束；最后小程序被重启 → 该次成绩直接作废（无记录）。
+ */
 function stopRunning() {
-    pressXY(C.XY.btnPause, "长按暂停", 1200);
-    sleep(4000);                                    // 等按钮切换动画
-    pressXY(C.XY.btnEndRun, "结束跑步", 200);
-    sleep(3500);                                    // 等二次确认弹窗
-    pressXY(C.XY.dlgEndConfirm, "确认结束", 200);    // 弹窗里的「结束跑步」
-    sleep(3500);
+    var ended = false;
+    for (var round = 1; round <= 3 && !ended; round++) {
+        tapBottomButton(C.XY.btnPause, "dark", 200, 880, 70, "长按暂停", 1200);
+        sleep(3500);
+
+        if (!isPaused()) {
+            U.log("  ⚠️ 第 " + round + " 轮：长按暂停未生效，重试");
+            continue;
+        }
+        U.log("  ✅ 已确认暂停（第 " + round + " 轮）");
+
+        tapBottomButton(C.XY.btnEndRun, "dark", 0, 540, 70, "结束跑步", 200);
+        sleep(3500);
+        pressXY(C.XY.dlgEndConfirm, "确认结束", 200);   // 有二次确认弹窗时才有用
+        sleep(3500);
+
+        if (!isRunning() && !isPaused()) {
+            U.log("  ✅ 已确认退出跑步状态");
+            ended = true;
+        } else {
+            U.log("  ⚠️ 第 " + round + " 轮：仍在跑步/暂停状态，整体重试");
+        }
+    }
+    R.snap("06-长按暂停后");
+    R.snap("08-确认结束后");
+    return ended;
 }
 
 /**
@@ -472,5 +685,10 @@ module.exports = {
     closeMapDialogs: closeMapDialogs,
     startRunning: startRunning,
     stopRunning: stopRunning,
-    closeMiniProgram: closeMiniProgram
+    closeMiniProgram: closeMiniProgram,
+    // 状态判定（供流程层校验用）
+    isRunning: isRunning,
+    isPaused: isPaused,
+    isRunPage: isRunPage,
+    hasDialog: hasDialog
 };
