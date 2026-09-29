@@ -95,7 +95,7 @@ var CFG = {
 var REC = {
     dir: "/sdcard/脚本/diag",       // 录屏与截图输出目录
     segSeconds: 170,                // 每段时长（screenrecord 单次上限 180s）
-    maxSegments: 20,                // 最多录多少段（20×170s ≈ 56min，足够）
+    maxSegments: 8,                 // 最多录多少段（8×170s≈23min；一次完整跑约 5 段）
     bitRate: 4000000,               // 码率 4Mbps ≈ 每秒 0.5MB
     sampleSeconds: 30               // 等达标期间每 N 秒补一张截图
 };
