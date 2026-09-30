@@ -183,7 +183,34 @@ function isRunPage() {
 
 /** 有弹窗（整屏被蒙层压暗） */
 function hasDialog() {
-    return isGrayish(pixel(C.PROBE.dialogScrim[0], C.PROBE.dialogScrim[1]));
+    // 居中弹窗（成绩合格标准 / 跑步提示）：整屏被蒙层压暗，白底页变成 ≈(102,102,102)
+    if (isGrayish(pixel(C.PROBE.dialogScrim[0], C.PROBE.dialogScrim[1]))) return true;
+    // ★ 底部弹窗（晨跑「安全提示」）：蒙层判据对它**失效**
+    //   —— 该点落在弹窗白色底板上，不会变灰，所以必须单独判一次
+    return isSafetySheet();
+}
+
+/**
+ * 是否停在晨跑专属的「安全提示」**底部弹窗**上。
+ *
+ * 判据：底部有绿色实心药丸（「进入乐跑」）**且** (539,2140) 不是绿色。
+ * 实测（2026-09-30 07:31 截图，1080x2400）：
+ *
+ * | 状态 | (682,2228) | (539,2140) | 判定 |
+ * | --- | --- | --- | --- |
+ * | 安全提示弹窗（跑步页） | 绿 (24,193,131) | 白 255（在弹窗底板上） | **true** |
+ * | 地图页 | 绿（同一颗「开始乐跑」） | 绿 | false |
+ * | 跑步页（无弹窗） | 白（空白处） | — | false |
+ * | 跑步中 | 深灰 (54,61,77)（在「长按暂停」药丸内） | 深灰 | false |
+ * | **暂停后** | 绿（在「继续跑步」药丸内） | 白（两按钮间隙） | false ← 靠 isPaused() 挡掉 |
+ *
+ * 单看 (682,2228) 会把「地图页的开始乐跑」「暂停后的继续跑步」都误判成弹窗，
+ * 所以必须加上后面两个排除条件。
+ */
+function isSafetySheet() {
+    return isGreen(pixel(C.XY.dlgEnterRun[0], C.XY.dlgEnterRun[1])) &&
+           !isGreen(pixel(C.PROBE.pausePill[0], C.PROBE.pausePill[1])) &&
+           !isPaused();
 }
 
 // ============== 按钮定位（按颜色扫描，不依赖写死的坐标）==============
@@ -566,25 +593,37 @@ function tapStart() {
 }
 
 /**
- * 关掉提示弹窗（自绘，只能盲点）。
- *   a) 「成绩合格标准」→「我知道了」：时间窗内必现
- *   b) 「跑步提示」→「自由跑」：仅时间窗外
+ * 关掉「点开始乐跑之后」的提示弹窗（自绘，只能盲点）。
  *
- * ⚠️ 到底弹哪个由**时间窗**决定，脚本无法预知，所以两个位置都点一遍；
- *    再用 hasDialog() 校验是否真的关掉，没关掉就补点。
+ * 弹窗随时段/状态变化，而且**可能连着弹两个**：
+ *   · 晨跑     ：「安全提示」**底部弹窗** →「进入乐跑」   ← 2026-09-30 新增
+ *   · 时间窗内 ：「成绩合格标准」居中弹窗 →「我知道了」
+ *   · 时间窗外 ：「跑步提示」居中弹窗 →「自由跑」
+ *   并且晨跑是「安全提示」点掉后进地图页，**又弹「成绩合格标准」**
+ *
+ * ⚠️ 2026-09-30 早 7:30 事故根因：脚本漏了「安全提示」，
+ *    (540,1552) 点在弹窗白底上（无效果），却又因 hasDialog() 判据失效
+ *    而误报"弹窗已关闭"，后面整段跑偏、跑步没真正开始。
+ *
+ * 所以这里改成**按特征逐个识别 + 循环到清空**，不依赖固定顺序盲点。
  */
 function closeMapDialogs() {
-    U.log("关闭提示弹窗（盲点）");
-    pressXY(C.XY.dlgAck, "我知道了(成绩合格标准)", 200);
-    sleep(1500);
-    if (hasDialog()) {
-        pressXY(C.XY.dlgFreeRun, "自由跑(仅时间窗外)", 200);
-        sleep(1500);
-    }
-    if (hasDialog()) {
-        U.log("  ⚠️ 弹窗仍在，再补点一次「我知道了」");
+    U.log("关闭提示弹窗（自绘，最多 3 轮）");
+    for (var round = 1; round <= 3; round++) {
+        // a) ★ 晨跑「安全提示」底部弹窗 →「进入乐跑」
+        if (isSafetySheet()) {
+            U.log("  第 " + round + " 轮：检测到「安全提示」→ 点「进入乐跑」");
+            tapBottomButton(C.XY.dlgEnterRun, "green", 300, 1080, 70, "进入乐跑", 200);
+            sleep(2000);
+            continue;      // 点掉后可能还有「成绩合格标准」，再跑一轮
+        }
+        // b) 居中弹窗（成绩合格标准 / 跑步提示）：两个位置都盲点一遍
+        U.log("  第 " + round + " 轮：盲点居中弹窗按钮");
         pressXY(C.XY.dlgAck, "我知道了(成绩合格标准)", 200);
         sleep(1500);
+        pressXY(C.XY.dlgFreeRun, "自由跑(仅时间窗外)", 200);
+        sleep(1500);
+        if (!isSafetySheet()) break;   // 清空了就收工；又弹安全提示则继续
     }
     U.log(hasDialog() ? "  ❌ 弹窗没关掉（后面很可能点空，见 step_04 截图）"
                       : "  ✅ 弹窗已关闭");
@@ -690,5 +729,6 @@ module.exports = {
     isRunning: isRunning,
     isPaused: isPaused,
     isRunPage: isRunPage,
-    hasDialog: hasDialog
+    hasDialog: hasDialog,
+    isSafetySheet: isSafetySheet
 };
